@@ -1,3 +1,5 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 """
 Real enrichment providers: Apollo.io + People Data Labs.
 Each returns normalized dicts that map to our lead schema.
