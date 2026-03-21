@@ -4,7 +4,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 POST /api/process — Run the enrichment → AI → scoring pipeline on a lead.
 Body: { "lead_id": "uuid" }
 """
-
 from http.server import BaseHTTPRequestHandler
 import json
 import asyncio
@@ -54,7 +53,7 @@ class handler(BaseHTTPRequestHandler):
                 "company_industry": result.get("company_industry"),
                 "company_employee_count": result.get("company_employee_count"),
                 "company_revenue": result.get("company_revenue"),
-                "contact_linkedin_url": safe("contact_linkedin_url", ""),
+                "contact_linkedin_url": result.get("contact_linkedin_url"),
                 "contact_phone_direct": result.get("contact_phone_direct"),
                 "contact_phone_mobile": result.get("contact_phone_mobile"),
             })
