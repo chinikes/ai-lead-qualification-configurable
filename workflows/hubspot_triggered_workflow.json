@@ -1,0 +1,352 @@
+{
+  "name": "AI Lead Qualification — HubSpot Triggered (Full Loop)",
+  "nodes": [
+    {
+      "parameters": {
+        "eventsUi": {
+          "eventValues": [
+            { "name": "contact.creation" }
+          ]
+        },
+        "additionalFields": {}
+      },
+      "id": "hubspot_trigger",
+      "name": "HubSpot — New Contact",
+      "type": "n8n-nodes-base.hubspotTrigger",
+      "typeVersion": 1,
+      "position": [250, 340],
+      "credentials": {
+        "hubspotDeveloperApi": { "id": "CONFIGURE_ME", "name": "HubSpot Developer API" }
+      },
+      "notes": "Fires whenever a new contact is created in HubSpot — by a rep, form submission, import, or API."
+    },
+    {
+      "parameters": {
+        "resource": "contact",
+        "operation": "get",
+        "contactId": "={{ $json.objectId }}",
+        "additionalFields": {
+          "properties": [
+            "email", "firstname", "lastname", "company", "jobtitle",
+            "phone", "hs_lead_source", "hs_lead_status",
+            "city", "state", "country", "website",
+            "ai_lead_score"
+          ]
+        }
+      },
+      "id": "hubspot_get_contact",
+      "name": "HubSpot — Get Contact Details",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 2,
+      "position": [480, 340],
+      "credentials": {
+        "hubspotApi": { "id": "CONFIGURE_ME", "name": "HubSpot API" }
+      },
+      "notes": "Fetch full contact details. The trigger only sends the object ID — we need email, name, company, etc."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.properties.ai_lead_score }}",
+              "operation": "isEmpty"
+            }
+          ]
+        }
+      },
+      "id": "skip_already_scored",
+      "name": "Already Scored?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [700, 340],
+      "notes": "Skip contacts that already have an AI score — prevents re-processing on updates."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Extract lead data from HubSpot contact ──────\nconst props = $input.first().json.properties || {};\n\n// Extract domain from email or company website\nlet domain = '';\nif (props.website) {\n  domain = props.website.replace(/^(https?:\\/\\/)?(www\\.)?/, '').replace(/\\/.*$/, '');\n} else if (props.email) {\n  const emailDomain = props.email.split('@')[1] || '';\n  const freeEmails = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'icloud.com'];\n  if (!freeEmails.includes(emailDomain)) {\n    domain = emailDomain;\n  }\n}\n\nconst leadData = {\n  email: props.email || null,\n  first_name: props.firstname || null,\n  last_name: props.lastname || null,\n  company_name: props.company || null,\n  company_domain: domain || null,\n  job_title: props.jobtitle || null,\n  phone: props.phone || null,\n  source: props.hs_lead_source || 'hubspot',\n  message: null,\n  _hubspot_contact_id: $input.first().json.id,\n};\n\nreturn [{ json: leadData }];"
+      },
+      "id": "extract_lead",
+      "name": "Extract Lead Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [920, 240],
+      "notes": "Transforms HubSpot contact properties into the lead format our Vercel API expects."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.VERCEL_API_URL }}/api/leads",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": { "timeout": 15000 }
+      },
+      "id": "create_lead",
+      "name": "Vercel — Create Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1140, 240],
+      "notes": "POST to Vercel API to create the lead in Supabase.",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.VERCEL_API_URL }}/api/process",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ lead_id: $json.lead.id }) }}",
+        "options": { "timeout": 45000 }
+      },
+      "id": "process_lead",
+      "name": "Vercel — Process Pipeline",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1360, 240],
+      "notes": "POST to Vercel API to run enrichment → AI → scoring. This is the heavy call (15-30s).",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.VERCEL_API_URL }}/api/leads?limit=1",
+        "options": { "timeout": 10000 }
+      },
+      "id": "fetch_results",
+      "name": "Vercel — Fetch Scored Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1580, 240],
+      "notes": "Fetch the fully scored lead back from Supabase via Vercel API."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Build HubSpot update + Slack payloads ────────\nconst leads = $input.first().json.leads || [];\nconst lead = leads[0] || {};\nconst score = (lead.scores && lead.scores[0]) || {};\nconst hubspotContactId = $('Extract Lead Data').first().json._hubspot_contact_id;\n\nconst contactName = lead.contact_full_name || [lead.first_name, lead.last_name].filter(Boolean).join(' ') || 'Unknown';\nconst companyName = lead.company_legal_name || lead.company_name || lead.company_domain || 'Unknown';\nconst title = lead.contact_title || lead.job_title || 'Unknown';\nconst industry = lead.company_industry || 'Unknown';\nconst composite = score.composite_score || 0;\nconst temperature = score.temperature || 'cold';\nconst decision = score.decision || 'needs_review';\nconst reasoning = score.decision_reasoning || '';\n\n// AI data\nconst icpFit = Math.round((lead.ai_icp_fit_score || 0) * 100);\nconst urgency = lead.ai_urgency || 'exploratory';\nconst summary = lead.ai_company_summary || '';\nconst signals = (lead.ai_buying_signals || []).map(s => typeof s === 'string' ? s : s.signal).filter(Boolean);\nconst pains = (lead.ai_pain_points || []).map(p => typeof p === 'string' ? p : p.pain_point).filter(Boolean);\nconst talkingPts = lead.ai_talking_points || [];\nconst confidence = Math.round((lead.overall_confidence || 0) * 100);\n\n// Lifecycle stage mapping\nconst lifecycleMap = {\n  qualified: 'salesqualifiedlead',\n  nurture: 'marketingqualifiedlead',\n  needs_review: 'lead',\n  disqualified: 'other',\n};\n\nreturn [{\n  json: {\n    hubspotContactId,\n    contactName, companyName, title, industry,\n    composite, temperature, decision, reasoning,\n    icpFit, urgency, summary,\n    signals, signalsText: signals.join('; '),\n    pains, painsText: pains.join('; '),\n    talkingPts, talkingPtsText: talkingPts.join('; '),\n    confidence,\n    firmographic: score.firmographic_score || 0,\n    demographic: score.demographic_score || 0,\n    behavioral: score.behavioral_score || 0,\n    aiFit: score.ai_fit_score || 0,\n    lifecycleStage: lifecycleMap[decision] || 'lead',\n    email: lead.email || '',\n    employees: lead.company_employee_count,\n    revenue: lead.company_revenue,\n    domain: lead.company_domain || '',\n  }\n}];"
+      },
+      "id": "build_payloads",
+      "name": "Build Update Payloads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1800, 240],
+      "notes": "Transforms the scored lead data into payloads for HubSpot update and Slack messages."
+    },
+    {
+      "parameters": {
+        "resource": "contact",
+        "operation": "update",
+        "contactId": "={{ $json.hubspotContactId }}",
+        "updateFields": {
+          "customPropertiesUi": {
+            "customPropertiesValues": [
+              { "property": "ai_lead_score", "value": "={{ String($json.composite) }}" },
+              { "property": "ai_temperature", "value": "={{ $json.temperature }}" },
+              { "property": "ai_qualification_decision", "value": "={{ $json.decision }}" },
+              { "property": "ai_icp_fit_score", "value": "={{ String($json.icpFit) }}" },
+              { "property": "ai_urgency", "value": "={{ $json.urgency }}" },
+              { "property": "ai_company_summary", "value": "={{ $json.summary.substring(0, 2000) }}" },
+              { "property": "ai_buying_signals", "value": "={{ $json.signalsText.substring(0, 2000) }}" },
+              { "property": "ai_enrichment_confidence", "value": "={{ String($json.confidence) }}" },
+              { "property": "ai_recommended_talking_points", "value": "={{ $json.talkingPtsText.substring(0, 2000) }}" },
+              { "property": "lifecyclestage", "value": "={{ $json.lifecycleStage }}" }
+            ]
+          }
+        }
+      },
+      "id": "hubspot_update",
+      "name": "HubSpot — Update Contact Scores",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 2,
+      "position": [2040, 140],
+      "credentials": {
+        "hubspotApi": { "id": "CONFIGURE_ME", "name": "HubSpot API" }
+      },
+      "notes": "Writes AI scores, signals, and qualification decision back to the HubSpot contact."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "outputIndex": 0,
+              "conditions": {
+                "conditions": [
+                  { "leftValue": "={{ $json.decision }}", "rightValue": "qualified", "operator": { "type": "string", "operation": "equals" } }
+                ]
+              }
+            },
+            {
+              "outputIndex": 1,
+              "conditions": {
+                "conditions": [
+                  { "leftValue": "={{ $json.decision }}", "rightValue": "nurture", "operator": { "type": "string", "operation": "equals" } }
+                ]
+              }
+            },
+            {
+              "outputIndex": 2,
+              "conditions": {
+                "conditions": [
+                  { "leftValue": "={{ $json.decision }}", "rightValue": "needs_review", "operator": { "type": "string", "operation": "equals" } }
+                ]
+              }
+            },
+            {
+              "outputIndex": 3,
+              "conditions": {
+                "conditions": [
+                  { "leftValue": "={{ $json.decision }}", "rightValue": "disqualified", "operator": { "type": "string", "operation": "equals" } }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "id": "route_slack",
+      "name": "Route Slack by Decision",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [2040, 380],
+      "notes": "Routes to different Slack channels based on qualification decision."
+    },
+    {
+      "parameters": {
+        "channel": "#sales-qualified-leads",
+        "text": "=:fire: *New Qualified Lead — Auto-scored from HubSpot*\n\n*Contact:* {{ $json.contactName }} ({{ $json.title }})\n*Company:* {{ $json.companyName }} — {{ $json.industry }}\n*Employees:* {{ $json.employees || '?' }} | *Revenue:* {{ $json.revenue || '?' }}\n\n*Score:* {{ $json.composite }}/100 — *{{ $json.temperature.toUpperCase() }}*\n*ICP Fit:* {{ $json.icpFit }}% | *Urgency:* {{ $json.urgency }}\n\n*Score Breakdown:*\n  Firmographic: {{ $json.firmographic }}/100\n  Demographic: {{ $json.demographic }}/100\n  Behavioral: {{ $json.behavioral }}/100\n  AI Fit: {{ $json.aiFit }}/100\n\n*Buying Signals:*\n{{ $json.signals.map(s => '  • ' + s).join('\\n') || '  None detected' }}\n\n*Talking Points for Rep:*\n{{ $json.talkingPts.map(t => '  → ' + t).join('\\n') || '  None' }}\n\n*Company Summary:*\n{{ $json.summary }}\n\n🔗 <https://app.hubspot.com/contacts/{{ $env.HUBSPOT_PORTAL_ID }}/contact/{{ $json.hubspotContactId }}|View in HubSpot>",
+        "otherOptions": {}
+      },
+      "id": "slack_qualified",
+      "name": "Slack — Qualified",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [2300, 240],
+      "credentials": {
+        "slackApi": { "id": "CONFIGURE_ME", "name": "Slack API" }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "channel": "#marketing-nurture",
+        "text": "=:seedling: *Lead → Nurture (from HubSpot)*\n\n*Contact:* {{ $json.contactName }} ({{ $json.title }})\n*Company:* {{ $json.companyName }} — {{ $json.industry }}\n*Score:* {{ $json.composite }}/100 — {{ $json.temperature }}\n*Reason:* {{ $json.reasoning }}\n\n*Pain Points:*\n{{ $json.pains.map(p => '  • ' + p).join('\\n') || '  None detected' }}\n\n🔗 <https://app.hubspot.com/contacts/{{ $env.HUBSPOT_PORTAL_ID }}/contact/{{ $json.hubspotContactId }}|View in HubSpot>",
+        "otherOptions": {}
+      },
+      "id": "slack_nurture",
+      "name": "Slack — Nurture",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [2300, 400],
+      "credentials": {
+        "slackApi": { "id": "CONFIGURE_ME", "name": "Slack API" }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "channel": "#lead-review-queue",
+        "text": "=:mag: *Lead Needs Review (from HubSpot)*\n\n*Contact:* {{ $json.contactName }} ({{ $json.title }})\n*Company:* {{ $json.companyName }}\n*Score:* {{ $json.composite }}/100 — {{ $json.temperature }}\n*Confidence:* {{ $json.confidence }}%\n*Reason:* {{ $json.reasoning }}\n\n🔗 <https://app.hubspot.com/contacts/{{ $env.HUBSPOT_PORTAL_ID }}/contact/{{ $json.hubspotContactId }}|View in HubSpot>",
+        "otherOptions": {}
+      },
+      "id": "slack_review",
+      "name": "Slack — Review",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [2300, 560],
+      "credentials": {
+        "slackApi": { "id": "CONFIGURE_ME", "name": "Slack API" }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.properties?.email }}",
+              "operation": "isNotEmpty"
+            }
+          ]
+        }
+      },
+      "id": "has_email",
+      "name": "Has Email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [700, 500],
+      "notes": "Skip contacts without email — can't enrich without an identifier."
+    }
+  ],
+  "connections": {
+    "HubSpot — New Contact": {
+      "main": [
+        [{ "node": "HubSpot — Get Contact Details", "type": "main", "index": 0 }]
+      ]
+    },
+    "HubSpot — Get Contact Details": {
+      "main": [
+        [
+          { "node": "Already Scored?", "type": "main", "index": 0 },
+          { "node": "Has Email?", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Already Scored?": {
+      "main": [
+        [{ "node": "Extract Lead Data", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Has Email?": {
+      "main": [
+        [],
+        []
+      ]
+    },
+    "Extract Lead Data": {
+      "main": [
+        [{ "node": "Vercel — Create Lead", "type": "main", "index": 0 }]
+      ]
+    },
+    "Vercel — Create Lead": {
+      "main": [
+        [{ "node": "Vercel — Process Pipeline", "type": "main", "index": 0 }]
+      ]
+    },
+    "Vercel — Process Pipeline": {
+      "main": [
+        [{ "node": "Vercel — Fetch Scored Lead", "type": "main", "index": 0 }]
+      ]
+    },
+    "Vercel — Fetch Scored Lead": {
+      "main": [
+        [{ "node": "Build Update Payloads", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Update Payloads": {
+      "main": [
+        [
+          { "node": "HubSpot — Update Contact Scores", "type": "main", "index": 0 },
+          { "node": "Route Slack by Decision", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Route Slack by Decision": {
+      "main": [
+        [{ "node": "Slack — Qualified", "type": "main", "index": 0 }],
+        [{ "node": "Slack — Nurture", "type": "main", "index": 0 }],
+        [{ "node": "Slack — Review", "type": "main", "index": 0 }],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "tags": [
+    { "name": "ai-lead-qualification" },
+    { "name": "hubspot-triggered" },
+    { "name": "production" }
+  ]
+}

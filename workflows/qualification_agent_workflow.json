@@ -1,0 +1,212 @@
+{
+  "name": "AI Lead Qualification — Qualification Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "qualify-lead",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook_qualify",
+      "name": "Qualification Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "qualify-lead-001",
+      "notes": "Receives EnrichedLead payload from Research Agent workflow or direct API call."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ══════════════════════════════════════════════════\n// FIRMOGRAPHIC SCORER — Company fit vs ICP\n// ══════════════════════════════════════════════════\n\nconst lead = $input.first().json;\nconst company = lead.company || {};\n\n// ── ICP Configuration ──────────────────────────\nconst ICP = {\n  targetIndustries: ['saas', 'technology', 'software', 'financial services',\n    'healthcare technology', 'e-commerce', 'digital marketing',\n    'professional services', 'manufacturing'],\n  minEmployees: 20,\n  maxEmployees: 5000,\n  preferredFunding: ['series a', 'series b', 'series c', 'growth', 'public'],\n  targetCountries: ['US', 'CA', 'UK', 'AU', 'DE', 'FR', 'NL'],\n  positiveTech: ['salesforce', 'hubspot', 'outreach', 'salesloft', 'gong',\n    'zoominfo', 'apollo', '6sense', 'drift', 'intercom',\n    'marketo', 'pardot', 'zapier', 'make', 'n8n'],\n};\n\nlet score = 0;\nconst breakdown = {};\n\n// Industry (0-30)\nlet industryScore = 0;\nif (company.industry) {\n  const ind = company.industry.toLowerCase();\n  if (ICP.targetIndustries.some(t => ind.includes(t) || t.includes(ind))) {\n    industryScore = 30;\n  } else if (company.sub_industry) {\n    const sub = company.sub_industry.toLowerCase();\n    if (ICP.targetIndustries.some(t => sub.includes(t))) industryScore = 20;\n  }\n}\nbreakdown.industry = { score: industryScore, max: 30, value: company.industry };\nscore += industryScore;\n\n// Employee Count (0-25)\nlet empScore = 0;\nif (company.employee_count) {\n  const count = company.employee_count;\n  if (count >= ICP.minEmployees && count <= ICP.maxEmployees) {\n    const sweet = (ICP.minEmployees + ICP.maxEmployees) / 2;\n    const distance = Math.abs(count - sweet) / sweet;\n    empScore = Math.round(25 * Math.max(0, 1 - distance * 0.5));\n  } else if (count < ICP.minEmployees) {\n    empScore = count / ICP.minEmployees > 0.3 ? Math.round(25 * (count / ICP.minEmployees) * 0.5) : 0;\n  } else {\n    empScore = 12;\n  }\n}\nbreakdown.employees = { score: empScore, max: 25, value: company.employee_count };\nscore += empScore;\n\n// Funding (0-15)\nlet fundScore = 0;\nif (company.funding_stage) {\n  const stage = company.funding_stage.toLowerCase();\n  if (ICP.preferredFunding.some(f => stage.includes(f))) fundScore = 15;\n  else fundScore = 5;\n}\nbreakdown.funding = { score: fundScore, max: 15, value: company.funding_stage };\nscore += fundScore;\n\n// Geography (0-15)\nlet geoScore = 0;\nif (company.headquarters_country) {\n  geoScore = ICP.targetCountries.includes(company.headquarters_country.toUpperCase()) ? 15 : 5;\n}\nbreakdown.geography = { score: geoScore, max: 15, value: company.headquarters_country };\nscore += geoScore;\n\n// Tech Stack (0-15)\nlet techScore = 0;\nconst techMatches = [];\nif (company.technologies && company.technologies.length > 0) {\n  const techLower = company.technologies.map(t => t.toLowerCase());\n  for (const target of ICP.positiveTech) {\n    if (techLower.includes(target.toLowerCase())) techMatches.push(target);\n  }\n  if (techMatches.length > 0) {\n    techScore = Math.min(15, 5 + (techMatches.length - 1) * 3.5);\n  }\n}\nbreakdown.tech_stack = { score: Math.round(techScore), max: 15, matches: techMatches };\nscore += Math.round(techScore);\n\nreturn [{ json: { ...lead, _scores: { firmographic: { score: Math.min(score, 100), breakdown } } } }];"
+      },
+      "id": "firmographic_scorer",
+      "name": "Score — Firmographic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300],
+      "notes": "Scores company fit: industry (30pts), employee count (25pts), funding (15pts), geography (15pts), tech stack (15pts)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ══════════════════════════════════════════════════\n// DEMOGRAPHIC SCORER — Contact fit vs buyer persona\n// ══════════════════════════════════════════════════\n\nconst lead = $input.first().json;\nconst contact = lead.contact || {};\n\nconst ICP_TITLES = ['vp of sales', 'vp sales', 'head of sales', 'sales director',\n  'chief revenue officer', 'cro', 'vp revenue operations',\n  'head of revenue operations', 'director of sales operations',\n  'vp of business development', 'head of growth', 'coo'];\nconst ICP_DEPTS = ['sales', 'revenue operations', 'business development', 'growth'];\n\nlet score = 0;\nconst breakdown = {};\n\n// Seniority (0-30)\nconst seniorityMap = { c_level: 30, vp: 28, director: 22, manager: 14, senior_ic: 8, ic: 4, unknown: 0 };\nconst senScore = seniorityMap[contact.seniority] || 0;\nbreakdown.seniority = { score: senScore, max: 30, value: contact.seniority };\nscore += senScore;\n\n// Title Match (0-25)\nlet titleScore = 0;\nif (contact.normalized_title) {\n  const titleLower = contact.normalized_title.toLowerCase();\n  if (ICP_TITLES.some(t => t === titleLower)) {\n    titleScore = 25;\n  } else {\n    const titleWords = new Set(titleLower.split(/\\s+/));\n    const stopWords = new Set(['of', 'the', 'and', 'a', 'in', 'for']);\n    let bestOverlap = 0;\n    for (const target of ICP_TITLES) {\n      const targetWords = new Set(target.split(/\\s+/));\n      const meaningful = [...titleWords].filter(w => targetWords.has(w) && !stopWords.has(w));\n      bestOverlap = Math.max(bestOverlap, meaningful.length);\n    }\n    if (bestOverlap >= 2) titleScore = 20;\n    else if (bestOverlap >= 1) titleScore = 15;\n  }\n}\nbreakdown.title = { score: titleScore, max: 25, value: contact.normalized_title };\nscore += titleScore;\n\n// Department (0-20)\nlet deptScore = 0;\nif (contact.department) {\n  const deptLower = contact.department.toLowerCase();\n  if (ICP_DEPTS.some(d => deptLower.includes(d) || d.includes(deptLower))) {\n    deptScore = 20;\n  } else if (['marketing', 'operations', 'strategy', 'customer success'].some(a => deptLower.includes(a))) {\n    deptScore = 8;\n  }\n}\nbreakdown.department = { score: deptScore, max: 20, value: contact.department };\nscore += deptScore;\n\n// Decision Maker (0-15)\nconst dmScore = contact.is_decision_maker ? 15 : 0;\nbreakdown.decision_maker = { score: dmScore, max: 15, value: contact.is_decision_maker };\nscore += dmScore;\n\n// Completeness (0-10)\nconst fields = [contact.full_name, contact.normalized_title, contact.department,\n  contact.linkedin_url, contact.phone_direct, contact.location_city];\nconst filled = fields.filter(f => f).length;\nconst compScore = Math.round((filled / fields.length) * 10);\nbreakdown.completeness = { score: compScore, max: 10, filled, total: fields.length };\nscore += compScore;\n\nlead._scores.demographic = { score: Math.min(score, 100), breakdown };\nreturn [{ json: lead }];"
+      },
+      "id": "demographic_scorer",
+      "name": "Score — Demographic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [750, 300],
+      "notes": "Scores contact fit: seniority (30pts), title match (25pts), department (20pts), decision maker (15pts), completeness (10pts)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ══════════════════════════════════════════════════\n// BEHAVIORAL SCORER — Engagement & intent signals\n// ══════════════════════════════════════════════════\n\nconst lead = $input.first().json;\nconst raw = lead.raw_lead || {};\n\nconst SOURCE_SCORES = { referral: 25, web_form: 20, chat_widget: 18, linkedin: 15, email: 12, event: 10, api: 8 };\nconst HIGH_INTENT = ['pricing', 'demo', 'trial', 'buy', 'purchase', 'implement', 'migrate', 'replace', 'budget', 'timeline', 'roi', 'cost'];\nconst MED_INTENT = ['interested', 'learn more', 'information', 'compare', 'evaluate', 'automate', 'streamline', 'improve'];\n\nlet score = 0;\nconst breakdown = {};\n\n// Source (0-25)\nconst srcScore = SOURCE_SCORES[raw.source] || 5;\nbreakdown.source = { score: srcScore, max: 25, value: raw.source };\nscore += srcScore;\n\n// Message Intent (0-30)\nlet msgScore = 0;\nconst signals = [];\nif (raw.message) {\n  const msgLower = raw.message.toLowerCase();\n  const highMatches = HIGH_INTENT.filter(kw => msgLower.includes(kw));\n  const medMatches = MED_INTENT.filter(kw => msgLower.includes(kw));\n  if (highMatches.length > 0) {\n    msgScore = Math.min(30, 20 + highMatches.length * 3);\n    signals.push(...highMatches.slice(0, 3));\n  } else if (medMatches.length > 0) {\n    msgScore = Math.min(20, 10 + medMatches.length * 3);\n    signals.push(...medMatches.slice(0, 3));\n  } else if (raw.message.length > 50) {\n    msgScore = 8;\n  } else {\n    msgScore = 3;\n  }\n}\nbreakdown.message_intent = { score: msgScore, max: 30, signals };\nscore += msgScore;\n\n// UTM (0-20)\nlet utmScore = 0;\nif (raw.utm_source) {\n  if (['cpc', 'paid', 'ppc'].includes(raw.utm_medium)) utmScore += 12;\n  else if (['email', 'social'].includes(raw.utm_medium)) utmScore += 8;\n  else utmScore += 4;\n  if (raw.utm_campaign) {\n    const camp = raw.utm_campaign.toLowerCase();\n    if (['demo', 'trial', 'pricing', 'bottom-funnel'].some(k => camp.includes(k))) utmScore += 8;\n    else if (['solution', 'product', 'comparison'].some(k => camp.includes(k))) utmScore += 5;\n  }\n}\nbreakdown.utm = { score: Math.min(utmScore, 20), max: 20 };\nscore += Math.min(utmScore, 20);\n\n// Page Intent (0-15)\nlet pageScore = 0;\nif (raw.page_url) {\n  const url = raw.page_url.toLowerCase();\n  if (['/pricing', '/demo', '/trial', '/contact-sales', '/request-demo', '/book-a-call'].some(p => url.includes(p))) pageScore = 15;\n  else if (['/solutions', '/product', '/features', '/case-studies'].some(p => url.includes(p))) pageScore = 10;\n  else pageScore = 3;\n}\nbreakdown.page_intent = { score: pageScore, max: 15 };\nscore += pageScore;\n\n// Timing (0-10)\nbreakdown.timing = { score: 5, max: 10 };\nscore += 5;\n\nlead._scores.behavioral = { score: Math.min(score, 100), breakdown };\nreturn [{ json: lead }];"
+      },
+      "id": "behavioral_scorer",
+      "name": "Score — Behavioral",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1000, 300],
+      "notes": "Scores engagement: source quality (25pts), message intent (30pts), UTM signals (20pts), page intent (15pts), timing (10pts)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ══════════════════════════════════════════════════\n// AI FIT SCORER — Uses LLM analysis from Research Agent\n// ══════════════════════════════════════════════════\n\nconst lead = $input.first().json;\nconst ai = lead.ai_analysis;\n\nlet score = 0;\nconst breakdown = {};\n\nif (!ai) {\n  // No AI analysis — use data confidence as proxy\n  score = Math.round((lead.overall_data_confidence || 0) * 40);\n  breakdown.note = 'No AI analysis available — using data confidence as proxy';\n} else {\n  // ICP Fit (0-40)\n  const icpScore = Math.round((ai.icp_fit_score || 0) * 40);\n  breakdown.icp_fit = { score: icpScore, max: 40 };\n  score += icpScore;\n\n  // Buying Signals (0-25)\n  let sigScore = 0;\n  const strengthMap = { strong: 10, moderate: 5, weak: 2 };\n  for (const sig of (ai.buying_signals || []).slice(0, 5)) {\n    sigScore += strengthMap[sig.strength] || 2;\n  }\n  sigScore = Math.min(sigScore, 25);\n  breakdown.buying_signals = { score: sigScore, max: 25, count: (ai.buying_signals || []).length };\n  score += sigScore;\n\n  // Pain Points (0-20)\n  let painScore = 0;\n  const relMap = { high: 8, medium: 4, low: 1.5 };\n  for (const pp of (ai.pain_points || []).slice(0, 5)) {\n    painScore += relMap[pp.relevance_to_product] || 1.5;\n  }\n  painScore = Math.min(painScore, 20);\n  breakdown.pain_points = { score: Math.round(painScore), max: 20 };\n  score += Math.round(painScore);\n\n  // Urgency (0-15)\n  const urgencyMap = { immediate: 15, near_term: 10, exploratory: 5, not_ready: 1 };\n  const urgScore = urgencyMap[ai.urgency_assessment] || 3;\n  breakdown.urgency = { score: urgScore, max: 15, value: ai.urgency_assessment };\n  score += urgScore;\n}\n\nlead._scores.ai_fit = { score: Math.min(score, 100), breakdown };\nreturn [{ json: lead }];"
+      },
+      "id": "ai_fit_scorer",
+      "name": "Score — AI Fit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 300],
+      "notes": "Translates Research Agent's LLM analysis into score: ICP fit (40pts), buying signals (25pts), pain points (20pts), urgency (15pts)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ══════════════════════════════════════════════════\n// COMPOSITE SCORE + DECISION ENGINE\n// ══════════════════════════════════════════════════\n\nconst lead = $input.first().json;\nconst s = lead._scores;\n\n// ── Weights ─────────────────────────────────────\nconst W = { firm: 0.30, demo: 0.25, behav: 0.20, ai: 0.25 };\n\n// ── Base weighted sum ───────────────────────────\nlet composite = (\n  (s.firmographic?.score || 0) * W.firm +\n  (s.demographic?.score || 0) * W.demo +\n  (s.behavioral?.score || 0) * W.behav +\n  (s.ai_fit?.score || 0) * W.ai\n);\n\n// ── Bonuses ─────────────────────────────────────\nlet bonus = 0;\nconst contact = lead.contact || {};\nconst ai = lead.ai_analysis;\n\n// Decision maker at C/VP level with good company fit\nif (contact.is_decision_maker\n    && ['c_level', 'vp'].includes(contact.seniority)\n    && (s.firmographic?.score || 0) >= 60) {\n  bonus += 8;\n}\n\n// Multiple strong buying signals\nif (ai?.buying_signals) {\n  const strong = ai.buying_signals.filter(s => s.strength === 'strong');\n  if (strong.length >= 2) bonus += 5;\n}\n\n// Immediate urgency\nif (ai?.urgency_assessment === 'immediate') bonus += 5;\n\n// Hiring in sales (growth signal)\nif (lead.company?.hiring_signals) {\n  const salesHiring = lead.company.hiring_signals.filter(h =>\n    /sales|revenue|growth|account exec/i.test(h));\n  if (salesHiring.length > 0) bonus += 3;\n}\n\n// ── Penalties ───────────────────────────────────\nlet penalty = 0;\nif ((lead.flags || []).includes('free_email')) penalty += 10;\nif ((lead.overall_data_confidence || 0) < 0.3) penalty += 8;\nelse if ((lead.overall_data_confidence || 0) < 0.5) penalty += 4;\nif (!lead.company) penalty += 12;\nif (contact && !contact.phone_direct && !contact.linkedin_url) penalty += 3;\n\ncomposite = Math.max(0, Math.min(100, composite + bonus - penalty));\n\n// ── Temperature ─────────────────────────────────\nlet temperature;\nif (composite >= 80) temperature = 'hot';\nelse if (composite >= 60) temperature = 'warm';\nelse if (composite >= 40) temperature = 'cool';\nelse temperature = 'cold';\n\n// ── Hard Disqualifiers ──────────────────────────\nlet decision, decisionReason;\nconst flags = lead.flags || [];\n\nif (flags.includes('no_identifiers')) {\n  decision = 'disqualified';\n  decisionReason = 'No email or company domain';\n} else if (lead.company?.employee_count < 5 && !lead.company?.funding_stage) {\n  decision = 'disqualified';\n  decisionReason = `Company too small (${lead.company?.employee_count} employees)`;\n} else if (composite >= 75) {\n  decision = 'qualified';\n  decisionReason = 'High composite score — auto-qualified';\n} else if (composite >= 45) {\n  // Context-dependent middle zone\n  if (contact.is_decision_maker\n      && ['c_level', 'vp'].includes(contact.seniority)\n      && (s.firmographic?.breakdown?.industry?.score || 0) >= 20) {\n    decision = 'qualified';\n    decisionReason = 'Decision maker at ICP company — upgraded';\n  } else if (lead.needs_human_review || (lead.overall_data_confidence || 0) < 0.5) {\n    decision = 'needs_review';\n    decisionReason = 'Mid-range score with incomplete data';\n  } else {\n    decision = 'nurture';\n    decisionReason = 'Score in nurture range — enroll in sequence';\n  }\n} else {\n  if ((lead.overall_data_confidence || 0) < 0.3 && !flags.includes('no_identifiers')) {\n    decision = 'needs_review';\n    decisionReason = 'Low score + low confidence — review before discarding';\n  } else {\n    decision = 'disqualified';\n    decisionReason = 'Below qualification threshold';\n  }\n}\n\n// ── Output ──────────────────────────────────────\nconst result = {\n  enriched_lead: lead,\n  firmographic_score: s.firmographic?.score || 0,\n  demographic_score: s.demographic?.score || 0,\n  behavioral_score: s.behavioral?.score || 0,\n  ai_fit_score: s.ai_fit?.score || 0,\n  composite_score: Math.round(composite * 10) / 10,\n  temperature: temperature,\n  decision: decision,\n  decision_reasoning: decisionReason,\n  bonus_applied: bonus,\n  penalty_applied: penalty,\n  scored_at: new Date().toISOString(),\n  scoring_model_version: 'v1.0',\n};\n\nreturn [{ json: result }];"
+      },
+      "id": "composite_decision",
+      "name": "Composite Score + Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1520, 300],
+      "notes": "Computes weighted composite, applies bonuses/penalties, classifies temperature, makes qualification decision."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            { "outputIndex": 0, "conditions": { "conditions": [{ "leftValue": "={{ $json.decision }}", "rightValue": "qualified", "operator": { "type": "string", "operation": "equals" } }] } },
+            { "outputIndex": 1, "conditions": { "conditions": [{ "leftValue": "={{ $json.decision }}", "rightValue": "nurture", "operator": { "type": "string", "operation": "equals" } }] } },
+            { "outputIndex": 2, "conditions": { "conditions": [{ "leftValue": "={{ $json.decision }}", "rightValue": "needs_review", "operator": { "type": "string", "operation": "equals" } }] } },
+            { "outputIndex": 3, "conditions": { "conditions": [{ "leftValue": "={{ $json.decision }}", "rightValue": "disqualified", "operator": { "type": "string", "operation": "equals" } }] } }
+          ]
+        }
+      },
+      "id": "decision_router",
+      "name": "Route by Decision",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1780, 300],
+      "notes": "Routes to different output paths: Qualified → Routing Agent, Nurture → Email sequence, Review → Slack, Disqualified → Archive."
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.HUBSPOT_API_URL }}/crm/v3/objects/contacts/{{ $json.enriched_lead.raw_lead.email }}?idProperty=email",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ properties: { ai_lead_score: String(Math.round($json.composite_score)), ai_temperature: $json.temperature, ai_qualification_decision: $json.decision, ai_qualification_reasoning: $json.decision_reasoning.substring(0, 2000), lifecyclestage: $json.decision === 'qualified' ? 'salesqualifiedlead' : ($json.decision === 'nurture' ? 'marketingqualifiedlead' : 'subscriber') } }) }}"
+      },
+      "id": "hubspot_update_score",
+      "name": "HubSpot — Update Score",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2060, 120],
+      "notes": "Updates HubSpot contact with qualification score, temperature, and lifecycle stage.",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "channel": "#sales-qualified-leads",
+        "text": "=:fire: *Qualified Lead!*\n\n*Contact:* {{ $json.enriched_lead.contact?.full_name || 'Unknown' }} ({{ $json.enriched_lead.contact?.normalized_title || 'Unknown' }})\n*Company:* {{ $json.enriched_lead.company?.legal_name || 'Unknown' }}\n*Score:* {{ Math.round($json.composite_score) }}/100 — *{{ $json.temperature.toUpperCase() }}*\n\n*Breakdown:*\n  Firmographic: {{ $json.firmographic_score }}/100\n  Demographic: {{ $json.demographic_score }}/100\n  Behavioral: {{ $json.behavioral_score }}/100\n  AI Fit: {{ $json.ai_fit_score }}/100\n\n*Decision:* {{ $json.decision.toUpperCase() }} — {{ $json.decision_reasoning }}\n\n_Routing to sales rep..._"
+      },
+      "id": "slack_qualified",
+      "name": "Slack — Qualified Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [2060, 280],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "channel": "#marketing-nurture",
+        "text": "=:seedling: *Lead → Nurture Sequence*\n\n*Contact:* {{ $json.enriched_lead.contact?.full_name || 'Unknown' }}\n*Company:* {{ $json.enriched_lead.company?.legal_name || 'Unknown' }}\n*Score:* {{ Math.round($json.composite_score) }}/100 — {{ $json.temperature }}\n*Reason:* {{ $json.decision_reasoning }}"
+      },
+      "id": "slack_nurture",
+      "name": "Slack — Nurture",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [2060, 420],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "channel": "#lead-review-queue",
+        "text": "=:mag: *Lead Needs Review*\n\n*Contact:* {{ $json.enriched_lead.contact?.full_name || 'Unknown' }}\n*Company:* {{ $json.enriched_lead.company?.legal_name || 'Unknown' }}\n*Score:* {{ Math.round($json.composite_score) }}/100\n*Reason:* {{ $json.decision_reasoning }}\n*Confidence:* {{ Math.round(($json.enriched_lead.overall_data_confidence || 0) * 100) }}%"
+      },
+      "id": "slack_review",
+      "name": "Slack — Review Queue",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [2060, 540],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: $json.decision, composite_score: $json.composite_score, temperature: $json.temperature, decision_reasoning: $json.decision_reasoning }) }}"
+      },
+      "id": "respond_result",
+      "name": "Respond — Result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2300, 300]
+    }
+  ],
+  "connections": {
+    "Qualification Webhook": {
+      "main": [[{ "node": "Score — Firmographic", "type": "main", "index": 0 }]]
+    },
+    "Score — Firmographic": {
+      "main": [[{ "node": "Score — Demographic", "type": "main", "index": 0 }]]
+    },
+    "Score — Demographic": {
+      "main": [[{ "node": "Score — Behavioral", "type": "main", "index": 0 }]]
+    },
+    "Score — Behavioral": {
+      "main": [[{ "node": "Score — AI Fit", "type": "main", "index": 0 }]]
+    },
+    "Score — AI Fit": {
+      "main": [[{ "node": "Composite Score + Decision", "type": "main", "index": 0 }]]
+    },
+    "Composite Score + Decision": {
+      "main": [[{ "node": "Route by Decision", "type": "main", "index": 0 }]]
+    },
+    "Route by Decision": {
+      "main": [
+        [{ "node": "HubSpot — Update Score", "type": "main", "index": 0 }, { "node": "Slack — Qualified Alert", "type": "main", "index": 0 }],
+        [{ "node": "HubSpot — Update Score", "type": "main", "index": 0 }, { "node": "Slack — Nurture", "type": "main", "index": 0 }],
+        [{ "node": "Slack — Review Queue", "type": "main", "index": 0 }],
+        [{ "node": "HubSpot — Update Score", "type": "main", "index": 0 }]
+      ]
+    },
+    "HubSpot — Update Score": {
+      "main": [[{ "node": "Respond — Result", "type": "main", "index": 0 }]]
+    },
+    "Slack — Qualified Alert": {
+      "main": [[{ "node": "Respond — Result", "type": "main", "index": 0 }]]
+    },
+    "Slack — Nurture": {
+      "main": [[{ "node": "Respond — Result", "type": "main", "index": 0 }]]
+    },
+    "Slack — Review Queue": {
+      "main": [[{ "node": "Respond — Result", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "tags": [
+    { "name": "ai-lead-qualification" },
+    { "name": "qualification-agent" },
+    { "name": "production" }
+  ]
+}

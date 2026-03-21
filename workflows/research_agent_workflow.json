@@ -1,0 +1,340 @@
+{
+  "name": "AI Lead Qualification — Research Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-intake",
+        "responseMode": "responseNode",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              { "name": "X-Pipeline", "value": "research-agent-v1" }
+            ]
+          }
+        }
+      },
+      "id": "webhook_intake",
+      "name": "Lead Intake Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "lead-intake-001",
+      "notes": "Receives raw lead data from web forms, chat widgets, or API integrations. Expects JSON body with at minimum an email or company_domain field."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Normalize & Validate Raw Lead ──────────────────────\n// Cleans input data, extracts domain from email,\n// validates required fields, and flags issues early.\n\nconst input = $input.first().json;\n\n// Normalize email\nlet email = (input.email || '').trim().toLowerCase();\nconst emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$/;\nif (!emailRegex.test(email)) {\n  email = null;\n}\n\n// Extract domain from email if not provided\nlet domain = (input.company_domain || '').trim().toLowerCase();\nif (!domain && email) {\n  domain = email.split('@')[1];\n}\n\n// Clean domain\nif (domain) {\n  domain = domain.replace(/^(https?:\\/\\/)?(www\\.)?/, '').replace(/\\/$/, '');\n}\n\n// Free email detection\nconst freeEmailDomains = new Set([\n  'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com',\n  'aol.com', 'icloud.com', 'mail.com', 'protonmail.com'\n]);\nconst isFreeEmail = email ? freeEmailDomains.has(email.split('@')[1]) : false;\n\n// Build normalized lead\nconst normalizedLead = {\n  source: input.source || 'web_form',\n  email: email,\n  first_name: (input.first_name || input.firstName || '').trim() || null,\n  last_name: (input.last_name || input.lastName || '').trim() || null,\n  company_name: (input.company_name || input.company || '').trim() || null,\n  company_domain: domain || null,\n  job_title: (input.job_title || input.title || '').trim() || null,\n  phone: (input.phone || '').trim() || null,\n  message: (input.message || input.comments || '').trim() || null,\n  utm_source: input.utm_source || null,\n  utm_medium: input.utm_medium || null,\n  utm_campaign: input.utm_campaign || null,\n  page_url: input.page_url || null,\n  ip_address: input.ip_address || null,\n  timestamp: new Date().toISOString(),\n  _meta: {\n    is_free_email: isFreeEmail,\n    has_email: !!email,\n    has_domain: !!domain,\n    has_company_name: !!(input.company_name || input.company),\n    has_message: !!(input.message || input.comments),\n    validation_passed: !!(email || domain),\n  }\n};\n\nreturn [{ json: normalizedLead }];"
+      },
+      "id": "normalize_lead",
+      "name": "Normalize Lead Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [470, 300],
+      "notes": "Cleans and normalizes raw input: email validation, domain extraction, free email detection, field mapping from various source formats."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json._meta.validation_passed }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "validate_gate",
+      "name": "Has Valid Identifiers?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [690, 300],
+      "notes": "Gate: only proceed if we have at least an email or company domain to enrich."
+    },
+    {
+      "parameters": {
+        "url": "https://api.apollo.io/v1/organizations/enrich",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "api_key", "value": "={{ $env.APOLLO_API_KEY }}" },
+            { "name": "domain", "value": "={{ $json.company_domain }}" }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "allowUnauthorizedCerts": false
+        }
+      },
+      "id": "apollo_company",
+      "name": "Apollo — Company Enrichment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [940, 160],
+      "notes": "Fetches company data from Apollo.io: industry, size, funding, tech stack.",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "https://company.clearbit.com/v2/companies/find",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "domain", "value": "={{ $json.company_domain }}" }
+          ]
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": { "timeout": 30000 }
+      },
+      "id": "clearbit_company",
+      "name": "Clearbit — Company Enrichment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [940, 340],
+      "notes": "Fetches company data from Clearbit: industry, headcount, revenue, technographics.",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "https://api.apollo.io/v1/people/match",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "api_key", "value": "={{ $env.APOLLO_API_KEY }}" },
+            { "name": "email", "value": "={{ $json.email }}" }
+          ]
+        },
+        "options": { "timeout": 30000 }
+      },
+      "id": "apollo_contact",
+      "name": "Apollo — Contact Enrichment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [940, 520],
+      "notes": "Fetches contact data from Apollo: title, seniority, department, phone, LinkedIn.",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Merge Enrichment Results ────────────────────────────\n// Combines parallel API results using 'first non-null wins'\n// for scalar fields and 'union' for list fields.\n\nconst lead = $('Normalize Lead Data').first().json;\nconst apolloCompany = $('Apollo — Company Enrichment').first()?.json?.organization || {};\nconst clearbitCompany = $('Clearbit — Company Enrichment').first()?.json || {};\nconst apolloContact = $('Apollo — Contact Enrichment').first()?.json?.person || {};\n\n// Helper: first non-null value from multiple sources\nfunction firstOf(...values) {\n  for (const v of values) {\n    if (v !== null && v !== undefined && v !== '' && v !== 0) return v;\n  }\n  return null;\n}\n\n// Helper: union arrays, deduplicated\nfunction unionArrays(...arrays) {\n  const seen = new Set();\n  const result = [];\n  for (const arr of arrays) {\n    for (const item of (arr || [])) {\n      const key = (typeof item === 'string') ? item.toLowerCase() : JSON.stringify(item);\n      if (!seen.has(key)) {\n        seen.add(key);\n        result.push(item);\n      }\n    }\n  }\n  return result;\n}\n\n// Seniority detection\nfunction detectSeniority(title) {\n  if (!title) return 'unknown';\n  const t = title.toLowerCase();\n  if (/\\b(ceo|cto|cfo|coo|cro|cmo|chief|founder|co-founder)\\b/.test(t)) return 'c_level';\n  if (/\\b(vp|vice president|svp|evp)\\b/.test(t)) return 'vp';\n  if (/\\b(director|head of)\\b/.test(t)) return 'director';\n  if (/\\b(manager|lead|team lead)\\b/.test(t)) return 'manager';\n  if (/\\b(senior|sr\\.|principal|staff)\\b/.test(t)) return 'senior_ic';\n  return 'ic';\n}\n\n// ── Merge Company Data ────\nconst company = {\n  domain: lead.company_domain,\n  legal_name: firstOf(clearbitCompany.name, apolloCompany.name, lead.company_name),\n  industry: firstOf(\n    clearbitCompany.category?.industry,\n    apolloCompany.industry\n  ),\n  sub_industry: firstOf(\n    clearbitCompany.category?.subIndustry,\n    apolloCompany.subindustry\n  ),\n  employee_count: firstOf(\n    clearbitCompany.metrics?.employees,\n    apolloCompany.estimated_num_employees\n  ),\n  estimated_revenue: firstOf(\n    clearbitCompany.metrics?.estimatedAnnualRevenue,\n    apolloCompany.annual_revenue_printed\n  ),\n  funding_stage: firstOf(\n    apolloCompany.latest_funding_stage,\n    clearbitCompany.crunchbase?.lastFundingType\n  ),\n  total_funding: firstOf(apolloCompany.total_funding_printed),\n  year_founded: firstOf(clearbitCompany.foundedYear, apolloCompany.founded_year),\n  headquarters_city: firstOf(clearbitCompany.geo?.city, apolloCompany.city),\n  headquarters_state: firstOf(clearbitCompany.geo?.state, apolloCompany.state),\n  headquarters_country: firstOf(clearbitCompany.geo?.country, apolloCompany.country),\n  description: firstOf(clearbitCompany.description, apolloCompany.short_description),\n  linkedin_url: firstOf(clearbitCompany.linkedin?.handle, apolloCompany.linkedin_url),\n  technologies: unionArrays(\n    clearbitCompany.tech,\n    apolloCompany.current_technologies\n  ),\n  keywords: unionArrays(\n    clearbitCompany.category?.industryGroup?.split(','),\n    apolloCompany.keywords\n  ),\n  hiring_signals: [],\n  recent_news: [],\n  enrichment_sources: ['apollo', 'clearbit'].filter(s => {\n    if (s === 'apollo') return Object.keys(apolloCompany).length > 0;\n    if (s === 'clearbit') return Object.keys(clearbitCompany).length > 0;\n    return false;\n  }),\n};\n\n// ── Merge Contact Data ────\nconst title = firstOf(apolloContact.title, lead.job_title);\nconst seniority = firstOf(apolloContact.seniority, detectSeniority(title));\n\nconst contact = {\n  email: lead.email,\n  full_name: firstOf(\n    apolloContact.name,\n    [lead.first_name, lead.last_name].filter(Boolean).join(' ') || null\n  ),\n  normalized_title: title,\n  seniority: seniority,\n  department: firstOf(\n    apolloContact.departments?.[0],\n    null\n  ),\n  linkedin_url: firstOf(apolloContact.linkedin_url),\n  phone_direct: firstOf(apolloContact.phone_numbers?.[0]?.sanitized_number, lead.phone),\n  location_city: firstOf(apolloContact.city),\n  location_state: firstOf(apolloContact.state),\n  location_country: firstOf(apolloContact.country),\n  previous_companies: (apolloContact.employment_history || []).slice(0, 5).map(e => e.organization_name).filter(Boolean),\n  is_decision_maker: ['c_level', 'vp', 'director'].includes(seniority),\n};\n\nreturn [{\n  json: {\n    lead: lead,\n    company: company,\n    contact: contact,\n  }\n}];"
+      },
+      "id": "merge_enrichment",
+      "name": "Merge Enrichment Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 340],
+      "notes": "Merges parallel enrichment results. Scalar fields use 'first non-null wins'. Lists are unioned and deduplicated."
+    },
+    {
+      "parameters": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{ $env.ANTHROPIC_API_KEY }}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 2000, messages: [{ role: 'user', content: `You are an expert B2B sales analyst. Analyze this lead data and respond with ONLY a JSON object.\n\n## Company\\n- Name: ${$json.company.legal_name || 'Unknown'}\\n- Industry: ${$json.company.industry || 'Unknown'}\\n- Employees: ${$json.company.employee_count || 'Unknown'}\\n- Revenue: ${$json.company.estimated_revenue || 'Unknown'}\\n- Funding: ${$json.company.funding_stage || 'Unknown'}\\n- Tech: ${($json.company.technologies || []).slice(0, 10).join(', ')}\\n- Description: ${$json.company.description || 'None'}\\n\\n## Contact\\n- Name: ${$json.contact.full_name || 'Unknown'}\\n- Title: ${$json.contact.normalized_title || 'Unknown'}\\n- Seniority: ${$json.contact.seniority}\\n- Decision Maker: ${$json.contact.is_decision_maker}\\n\\n## Message\\n${$json.lead.message || 'None'}\\n\\n## ICP Criteria\\n- Target: SaaS, Technology, Financial Services, Healthcare Tech\\n- Size: 20-5000 employees\\n- Titles: VP Sales, CRO, Director Sales Ops, Head of Growth\\n- Tech signals: Salesforce, HubSpot, Outreach, Gong\\n\\nRespond with JSON:\\n{\\n  \"company_summary\": \"2-3 sentences\",\\n  \"icp_fit_narrative\": \"why this does/doesn't match ICP\",\\n  \"icp_fit_score\": 0.0-1.0,\\n  \"buying_signals\": [{\"signal\": \"\", \"source\": \"\", \"strength\": \"strong|moderate|weak\"}],\\n  \"pain_points\": [{\"pain_point\": \"\", \"evidence\": \"\", \"relevance_to_product\": \"high|medium|low\"}],\\n  \"recommended_talking_points\": [\"point1\", \"point2\"],\\n  \"urgency_assessment\": \"immediate|near_term|exploratory|not_ready\",\\n  \"confidence\": 0.0-1.0,\\n  \"reasoning\": \"step-by-step explanation\"\\n}` }] }) }}",
+        "options": { "timeout": 60000 }
+      },
+      "id": "ai_analysis",
+      "name": "Claude AI — Deep Analysis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1440, 340],
+      "notes": "Calls Claude API for structured lead analysis: ICP fit, buying signals, pain points, urgency assessment.",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Parse AI Analysis & Compute Confidence ──────────────\n// Extracts structured JSON from LLM response,\n// computes overall confidence, and flags issues.\n\nconst mergedData = $('Merge Enrichment Results').first().json;\nconst aiResponse = $input.first().json;\n\n// Parse AI response\nlet aiAnalysis = null;\ntry {\n  const text = aiResponse.content?.[0]?.text || '';\n  const jsonMatch = text.match(/\\{[\\s\\S]*\\}/);\n  if (jsonMatch) {\n    aiAnalysis = JSON.parse(jsonMatch[0]);\n  }\n} catch (e) {\n  // AI analysis failed — continue without it\n}\n\n// ── Compute Confidence Score ────\nconst companyFields = [\n  'legal_name', 'industry', 'employee_count', 'estimated_revenue',\n  'funding_stage', 'headquarters_city', 'description'\n];\nconst companyFilled = companyFields.filter(f => mergedData.company[f]).length;\nconst companyConfidence = companyFilled / companyFields.length;\n\nconst contactFields = [\n  'full_name', 'normalized_title', 'department', 'linkedin_url',\n  'phone_direct', 'location_city'\n];\nconst contactFilled = contactFields.filter(f => mergedData.contact[f]).length;\nconst contactConfidence = contactFilled / contactFields.length;\n\nconst aiConfidence = aiAnalysis?.confidence || 0;\n\n// Weighted average\nlet overallConfidence = (\n  companyConfidence * 0.35 +\n  contactConfidence * 0.30 +\n  aiConfidence * 0.35\n);\n\n// Apply penalties\nconst flags = [];\nconst reviewReasons = [];\n\nif (mergedData.lead._meta?.is_free_email) {\n  flags.push('free_email');\n  overallConfidence *= 0.8;\n}\nif (!mergedData.lead.company_domain) {\n  flags.push('no_company_domain');\n}\nif (!aiAnalysis) {\n  flags.push('ai_analysis_failed');\n  overallConfidence *= 0.7;\n}\nif (overallConfidence < 0.4) {\n  flags.push('very_low_confidence');\n  reviewReasons.push(`Confidence ${(overallConfidence * 100).toFixed(0)}% below threshold`);\n}\nif (overallConfidence < 0.7 && overallConfidence >= 0.4) {\n  flags.push('low_confidence');\n  reviewReasons.push(`Confidence ${(overallConfidence * 100).toFixed(0)}% — review recommended`);\n}\n\nconst enrichedLead = {\n  raw_lead: mergedData.lead,\n  company: mergedData.company,\n  contact: mergedData.contact,\n  ai_analysis: aiAnalysis,\n  overall_data_confidence: Math.round(overallConfidence * 1000) / 1000,\n  flags: flags,\n  needs_human_review: reviewReasons.length > 0,\n  review_reasons: reviewReasons,\n  enrichment_completed_at: new Date().toISOString(),\n};\n\nreturn [{ json: enrichedLead }];"
+      },
+      "id": "build_enriched_lead",
+      "name": "Build Enriched Lead + Confidence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1680, 340],
+      "notes": "Parses AI analysis, computes weighted confidence score across all data sources, flags low-confidence leads for review."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.overall_data_confidence }}",
+              "operation": "largerEqual",
+              "value2": 0.4
+            }
+          ]
+        }
+      },
+      "id": "confidence_gate",
+      "name": "Confidence >= 40%?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1920, 340],
+      "notes": "Route based on confidence: >= 40% proceeds to qualification, < 40% goes to human review queue."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.HUBSPOT_API_URL }}/crm/v3/objects/contacts",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ properties: { email: $json.raw_lead.email, firstname: $json.raw_lead.first_name, lastname: $json.raw_lead.last_name, company: $json.company?.legal_name, jobtitle: $json.contact?.normalized_title, ai_icp_fit_score: String(Math.round(($json.ai_analysis?.icp_fit_score || 0) * 100)), ai_enrichment_confidence: String(Math.round($json.overall_data_confidence * 100)), ai_urgency: $json.ai_analysis?.urgency_assessment || 'unknown', ai_company_summary: ($json.ai_analysis?.company_summary || '').substring(0, 2000), ai_buying_signals: ($json.ai_analysis?.buying_signals || []).map(s => s.signal).join('; ').substring(0, 2000) } }) }}"
+      },
+      "id": "hubspot_sync",
+      "name": "Sync to HubSpot",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2160, 240],
+      "notes": "Creates/updates HubSpot contact with all enrichment data and AI analysis results.",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "channel": "#lead-alerts",
+        "text": "=:robot_face: *New Lead Enriched*\n\n*Contact:* {{ $json.contact?.full_name || 'Unknown' }} ({{ $json.contact?.normalized_title || 'Unknown' }})\n*Company:* {{ $json.company?.legal_name || 'Unknown' }} — {{ $json.company?.industry || 'Unknown' }}\n*Employees:* {{ $json.company?.employee_count || '?' }} | *Revenue:* {{ $json.company?.estimated_revenue || '?' }}\n*ICP Fit:* {{ Math.round(($json.ai_analysis?.icp_fit_score || 0) * 100) }}% | *Confidence:* {{ Math.round($json.overall_data_confidence * 100) }}%\n*Urgency:* {{ $json.ai_analysis?.urgency_assessment || 'unknown' }}\n*Flags:* {{ ($json.flags || []).join(', ') || 'none' }}\n\n> {{ $json.ai_analysis?.company_summary || 'No summary available' }}",
+        "otherOptions": {}
+      },
+      "id": "slack_notification",
+      "name": "Slack — Lead Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [2160, 440],
+      "notes": "Posts enriched lead summary to Slack for visibility.",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "channel": "#lead-review-queue",
+        "text": "=:warning: *Lead Needs Review*\n\n*Email:* {{ $json.raw_lead.email || 'Unknown' }}\n*Company:* {{ $json.company?.legal_name || $json.raw_lead.company_name || 'Unknown' }}\n*Confidence:* {{ Math.round($json.overall_data_confidence * 100) }}%\n*Flags:* {{ ($json.flags || []).join(', ') }}\n*Review Reasons:*\n{{ ($json.review_reasons || []).map(r => '• ' + r).join('\\n') }}\n\nPlease review and manually qualify or disqualify.",
+        "otherOptions": {}
+      },
+      "id": "slack_review",
+      "name": "Slack — Review Queue",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [2160, 600],
+      "notes": "Low-confidence leads go to Slack review queue for human triage.",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'enriched', lead_id: $json.raw_lead.email, confidence: $json.overall_data_confidence, flags: $json.flags, icp_fit: $json.ai_analysis?.icp_fit_score }) }}"
+      },
+      "id": "respond_success",
+      "name": "Respond — Enriched",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2400, 240],
+      "notes": "Returns enrichment summary to the webhook caller."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'validation_failed', error: 'No email or company domain provided' }) }}",
+        "options": { "responseCode": 422 }
+      },
+      "id": "respond_invalid",
+      "name": "Respond — Invalid",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [940, 700],
+      "notes": "Returns 422 when lead has no identifiers."
+    }
+  ],
+  "connections": {
+    "Lead Intake Webhook": {
+      "main": [
+        [{ "node": "Normalize Lead Data", "type": "main", "index": 0 }]
+      ]
+    },
+    "Normalize Lead Data": {
+      "main": [
+        [{ "node": "Has Valid Identifiers?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Has Valid Identifiers?": {
+      "main": [
+        [
+          { "node": "Apollo — Company Enrichment", "type": "main", "index": 0 },
+          { "node": "Clearbit — Company Enrichment", "type": "main", "index": 0 },
+          { "node": "Apollo — Contact Enrichment", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Respond — Invalid", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Apollo — Company Enrichment": {
+      "main": [
+        [{ "node": "Merge Enrichment Results", "type": "main", "index": 0 }]
+      ]
+    },
+    "Clearbit — Company Enrichment": {
+      "main": [
+        [{ "node": "Merge Enrichment Results", "type": "main", "index": 0 }]
+      ]
+    },
+    "Apollo — Contact Enrichment": {
+      "main": [
+        [{ "node": "Merge Enrichment Results", "type": "main", "index": 0 }]
+      ]
+    },
+    "Merge Enrichment Results": {
+      "main": [
+        [{ "node": "Claude AI — Deep Analysis", "type": "main", "index": 0 }]
+      ]
+    },
+    "Claude AI — Deep Analysis": {
+      "main": [
+        [{ "node": "Build Enriched Lead + Confidence", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Enriched Lead + Confidence": {
+      "main": [
+        [{ "node": "Confidence >= 40%?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Confidence >= 40%?": {
+      "main": [
+        [
+          { "node": "Sync to HubSpot", "type": "main", "index": 0 },
+          { "node": "Slack — Lead Alert", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Slack — Review Queue", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Sync to HubSpot": {
+      "main": [
+        [{ "node": "Respond — Enriched", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "tags": [
+    { "name": "ai-lead-qualification" },
+    { "name": "research-agent" },
+    { "name": "production" }
+  ]
+}
