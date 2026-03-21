@@ -55,6 +55,8 @@ class handler(BaseHTTPRequestHandler):
                 "company_employee_count": result.get("company_employee_count"),
                 "company_revenue": result.get("company_revenue"),
                 "contact_linkedin_url": safe("contact_linkedin_url", ""),
+                "contact_phone_direct": result.get("contact_phone_direct"),
+                "contact_phone_mobile": result.get("contact_phone_mobile"),
             })
 
         except Exception as e:
