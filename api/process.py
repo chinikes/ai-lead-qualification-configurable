@@ -54,6 +54,7 @@ class handler(BaseHTTPRequestHandler):
                 "company_industry": result.get("company_industry"),
                 "company_employee_count": result.get("company_employee_count"),
                 "company_revenue": result.get("company_revenue"),
+                "contact_linkedin_url": safe("contact_linkedin_url", ""),
             })
 
         except Exception as e:
