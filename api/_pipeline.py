@@ -1,3 +1,5 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 """
 Pipeline orchestrator — chains enrichment → AI analysis → scoring.
 Called by the /api/process endpoint.
@@ -5,10 +7,10 @@ Called by the /api/process endpoint.
 
 import asyncio
 import re
-from _lib.db import get_client, update_lead, upsert_score, log_activity, get_scoring_config
-from _lib.enrich import enrich_lead
-from _lib.ai import analyze_lead
-from _lib.scorer import score_lead
+from _db import get_client, update_lead, upsert_score, log_activity, get_scoring_config
+from _enrich import enrich_lead
+from _ai import analyze_lead
+from _scorer import score_lead
 
 FREE_EMAIL_DOMAINS = {
     "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
