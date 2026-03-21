@@ -1,5 +1,3 @@
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 """
 Real enrichment providers: Apollo.io + People Data Labs.
 Each returns normalized dicts that map to our lead schema.
@@ -79,6 +77,23 @@ async def apollo_enrich_contact(email: str) -> dict | None:
             phones = person.get("phone_numbers") or []
             history = person.get("employment_history") or []
 
+            # Extract phone numbers by type
+            direct_phone = None
+            mobile_phone = None
+            for p in phones:
+                ptype = (p.get("type") or "").lower()
+                number = p.get("sanitized_number") or p.get("number")
+                if not number:
+                    continue
+                if ptype in ("mobile", "personal"):
+                    if not mobile_phone:
+                        mobile_phone = number
+                elif ptype in ("work_direct", "direct", "work"):
+                    if not direct_phone:
+                        direct_phone = number
+                elif not direct_phone:
+                    direct_phone = number
+
             return {
                 "source": "apollo",
                 "contact_full_name": person.get("name"),
@@ -86,7 +101,8 @@ async def apollo_enrich_contact(email: str) -> dict | None:
                 "contact_seniority": seniority,
                 "contact_department": departments[0] if departments else None,
                 "contact_linkedin_url": person.get("linkedin_url"),
-                "contact_phone_direct": phones[0].get("sanitized_number") if phones else None,
+                "contact_phone_direct": direct_phone,
+                "contact_phone_mobile": mobile_phone,
                 "contact_location_city": person.get("city"),
                 "contact_location_country": person.get("country"),
                 "contact_previous_companies": [
@@ -180,6 +196,7 @@ async def pdl_enrich_contact(email: str) -> dict | None:
                 "contact_department": data.get("job_company_industry"),
                 "contact_linkedin_url": data.get("linkedin_url"),
                 "contact_phone_direct": (data.get("phone_numbers") or [None])[0],
+                "contact_phone_mobile": (data.get("mobile_phone") or data.get("personal_numbers") or [None])[0] if isinstance(data.get("mobile_phone") or data.get("personal_numbers"), list) else data.get("mobile_phone"),
                 "contact_location_city": data.get("location_locality"),
                 "contact_location_country": data.get("location_country"),
                 "contact_previous_companies": prev,
