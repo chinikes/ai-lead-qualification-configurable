@@ -242,6 +242,16 @@ async def hunter_enrich_combined(email: str) -> dict | None:
             person_raw = payload.get("person") or {}
             company_raw = payload.get("company") or {}
 
+            # Temporary debug logging (remove once Hunter response shape is locked in)
+            logger.info(f"[hunter] person keys: {sorted(person_raw.keys())}")
+            logger.info(f"[hunter] company keys: {sorted(company_raw.keys())}")
+            if person_raw.get("linkedin"):
+                logger.info(f"[hunter] person.linkedin raw: {person_raw.get('linkedin')!r}")
+            if company_raw.get("linkedin"):
+                logger.info(f"[hunter] company.linkedin raw: {company_raw.get('linkedin')!r}")
+            if company_raw.get("technologies"):
+                logger.info(f"[hunter] company.technologies count: {len(company_raw.get('technologies') or [])}")
+
             # ---- Person mapping ----
             name_obj = person_raw.get("name") or {}
             employment = person_raw.get("employment") or {}
@@ -470,29 +480,45 @@ def _map_hunter_seniority(level: str | None) -> str | None:
 
 
 def _hunter_linkedin(person: dict) -> str | None:
-    """Extract LinkedIn URL from Hunter person payload."""
+    """Extract LinkedIn URL from Hunter person payload, normalizing whatever
+    shape Hunter returns: full URL, path with prefix, or bare handle."""
     handles = person.get("linkedin") or person.get("social") or {}
+    raw = None
     if isinstance(handles, str):
-        return handles if handles.startswith("http") else f"https://www.linkedin.com/in/{handles}"
-    if isinstance(handles, dict):
-        url = handles.get("url") or handles.get("handle")
-        if not url:
-            return None
-        return url if url.startswith("http") else f"https://www.linkedin.com/in/{url}"
-    return None
+        raw = handles
+    elif isinstance(handles, dict):
+        raw = handles.get("url") or handles.get("handle")
+    return _normalize_linkedin_url(raw, kind="in")
 
 
 def _hunter_company_linkedin(company: dict) -> str | None:
     """Extract company LinkedIn URL from Hunter company payload."""
     li = company.get("linkedin") or {}
+    raw = None
     if isinstance(li, str):
-        return li if li.startswith("http") else f"https://www.linkedin.com/company/{li}"
-    if isinstance(li, dict):
-        url = li.get("url") or li.get("handle")
-        if not url:
-            return None
-        return url if url.startswith("http") else f"https://www.linkedin.com/company/{url}"
-    return None
+        raw = li
+    elif isinstance(li, dict):
+        raw = li.get("url") or li.get("handle")
+    return _normalize_linkedin_url(raw, kind="company")
+
+
+def _normalize_linkedin_url(raw: str | None, kind: str) -> str | None:
+    """
+    Normalize a LinkedIn reference into a clean URL.
+    Accepts: full URL, "in/foo", "company/foo", or bare handle "foo".
+    `kind` is "in" (people) or "company" (orgs) — used only when bare handle.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    # Full URL — return as-is
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+    # Path that already includes the prefix segment
+    if s.startswith("in/") or s.startswith("company/"):
+        return f"https://www.linkedin.com/{s}"
+    # Bare handle — prepend the appropriate kind
+    return f"https://www.linkedin.com/{kind}/{s}"
 
 
 def _employees_range_to_int(rng: str | None) -> int | None:
