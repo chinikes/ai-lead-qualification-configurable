@@ -277,7 +277,7 @@ async def hunter_enrich_combined(email: str) -> dict | None:
                 "company_legal_name": company_raw.get("legalName") or company_raw.get("name"),
                 "company_industry": cat.get("industry"),
                 "company_sub_industry": cat.get("subIndustry"),
-                "company_employee_count": metrics.get("employees") or _employees_range_to_int(company_raw.get("employees_range")),
+                "company_employee_count": _coerce_employee_count(metrics.get("employees") or company_raw.get("employees_range")),
                 "company_revenue": _format_revenue(metrics.get("annualRevenue")),
                 "company_funding_stage": None,   # Hunter doesn't expose funding stage
                 "company_total_funding": _format_funding(metrics.get("raised")),
@@ -507,3 +507,25 @@ def _employees_range_to_int(rng: str | None) -> int | None:
         return sum(nums) // len(nums)
     except (ValueError, TypeError):
         return None
+
+
+def _coerce_employee_count(val) -> int | None:
+    """
+    Normalize whatever Hunter (or any provider) gives us for employee count
+    into an integer, since the DB column is INTEGER. Hunter is inconsistent —
+    'employees' may come as int, '127', '11-50', '1000+', or None.
+    """
+    if val is None or val == "":
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    if isinstance(val, str):
+        s = val.strip()
+        # Pure int like "127"
+        if s.isdigit():
+            return int(s)
+        # Range like "11-50" or "1000+" — fall back to midpoint helper
+        return _employees_range_to_int(s)
+    return None
