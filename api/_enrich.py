@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 APOLLO_KEY = lambda: os.environ.get("APOLLO_API_KEY", "")
 PDL_KEY = lambda: os.environ.get("PDL_API_KEY", "")
+HUNTER_KEY = lambda: os.environ.get("HUNTER_API_KEY", "")
 
 
 # ══════════════════════════════════════════════════════
@@ -208,6 +209,105 @@ async def pdl_enrich_contact(email: str) -> dict | None:
 
 
 # ══════════════════════════════════════════════════════
+#  HUNTER.IO (Combined Enrichment)
+# ══════════════════════════════════════════════════════
+#
+# Hunter's /v2/combined/find endpoint takes an email and returns
+# both person AND company in one call (0.2 credits per call,
+# charged only when data is returned). One-call replacement for
+# Apollo's two-endpoint people/match + organizations/enrich pair.
+#
+# Docs: https://hunter.io/api-documentation/v2#combined-enrichment
+
+async def hunter_enrich_combined(email: str) -> dict | None:
+    """
+    Enrich BOTH person and company via Hunter Combined Enrichment.
+    Returns a dict with a 'person' and 'company' sub-dict matching
+    our existing apollo_enrich_contact / apollo_enrich_company shape.
+    The merge runner (enrich_lead) splits these two halves into the
+    flat merged record.
+    """
+    if not HUNTER_KEY() or not email:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                "https://api.hunter.io/v2/combined/find",
+                params={"email": email, "api_key": HUNTER_KEY()},
+            )
+            if resp.status_code != 200:
+                logger.error(f"[hunter] Combined enrich failed: {resp.status_code} {resp.text[:200]}")
+                return None
+            payload = resp.json().get("data") or {}
+            person_raw = payload.get("person") or {}
+            company_raw = payload.get("company") or {}
+
+            # Temporary debug logging (remove once Hunter response shape is locked in)
+            logger.info(f"[hunter] person keys: {sorted(person_raw.keys())}")
+            logger.info(f"[hunter] company keys: {sorted(company_raw.keys())}")
+            if person_raw.get("linkedin"):
+                logger.info(f"[hunter] person.linkedin raw: {person_raw.get('linkedin')!r}")
+            if company_raw.get("linkedin"):
+                logger.info(f"[hunter] company.linkedin raw: {company_raw.get('linkedin')!r}")
+            if company_raw.get("technologies"):
+                logger.info(f"[hunter] company.technologies count: {len(company_raw.get('technologies') or [])}")
+
+            # ---- Person mapping ----
+            name_obj = person_raw.get("name") or {}
+            employment = person_raw.get("employment") or {}
+            geo = person_raw.get("geo") or {}
+            title = employment.get("title")
+            seniority_raw = employment.get("seniority")
+            seniority = _map_hunter_seniority(seniority_raw) or _detect_seniority(title)
+
+            person_dict = {
+                "source": "hunter",
+                "contact_full_name": name_obj.get("fullName") or person_raw.get("name") if isinstance(person_raw.get("name"), str) else name_obj.get("fullName"),
+                "contact_title": title,
+                "contact_seniority": seniority,
+                "contact_department": employment.get("role"),
+                "contact_linkedin_url": _hunter_linkedin(person_raw),
+                "contact_phone_direct": None,   # Hunter doesn't return personal phones
+                "contact_phone_mobile": None,
+                "contact_location_city": geo.get("city"),
+                "contact_location_country": geo.get("country"),
+                "contact_previous_companies": [],  # Hunter Combined doesn't expose history
+                "contact_is_decision_maker": seniority in ("c_level", "vp", "director"),
+            }
+
+            # ---- Company mapping ----
+            cat = company_raw.get("category") or {}
+            geo_co = company_raw.get("geo") or {}
+            site = company_raw.get("site") or {}
+            site_phones = site.get("phoneNumbers") or []
+            metrics = company_raw.get("metrics") or {}
+
+            company_dict = {
+                "source": "hunter",
+                "company_legal_name": company_raw.get("legalName") or company_raw.get("name"),
+                "company_industry": cat.get("industry"),
+                "company_sub_industry": cat.get("subIndustry"),
+                "company_employee_count": _coerce_employee_count(metrics.get("employees") or company_raw.get("employees_range")),
+                "company_revenue": _format_revenue(metrics.get("annualRevenue")),
+                "company_funding_stage": _hunter_funding_stage(company_raw.get("fundingRounds")),
+                "company_total_funding": _format_funding(metrics.get("raised") or _hunter_total_raised(company_raw.get("fundingRounds"))),
+                "company_year_founded": company_raw.get("foundedYear") or company_raw.get("founded"),
+                "company_hq_city": geo_co.get("city"),
+                "company_hq_state": geo_co.get("state"),
+                "company_hq_country": geo_co.get("country"),
+                "company_description": company_raw.get("description"),
+                "company_linkedin_url": _hunter_company_linkedin(company_raw),
+                "company_technologies": (company_raw.get("tech") or []) + (company_raw.get("techCategories") or []),
+                "company_keywords": company_raw.get("tags") or [],
+            }
+
+            return {"person": person_dict, "company": company_dict}
+    except Exception as e:
+        logger.error(f"[hunter] Combined enrich error: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════
 #  PARALLEL ENRICHMENT RUNNER
 # ══════════════════════════════════════════════════════
 
@@ -215,35 +315,62 @@ import asyncio
 
 async def enrich_lead(domain: str | None, email: str | None) -> dict:
     """
-    Run all enrichment providers in parallel.
-    Returns merged dict with 'first non-null wins' for scalars
+    Run all configured enrichment providers in parallel.
+    Each provider is gated on the presence of its API key env var,
+    so the system gracefully degrades (or scales up) by setting/unsetting
+    keys in Vercel — no code change needed.
+
+    Active providers (when their key is set):
+      • Hunter.io  Combined Enrichment  (HUNTER_API_KEY)  — primary
+      • PDL        Person + Company     (PDL_API_KEY)     — secondary
+      • Apollo.io  People + Org         (APOLLO_API_KEY)  — optional fallback
+
+    Returns a merged dict with 'first non-null wins' for scalars
     and 'union' for lists.
     """
     tasks = []
     task_labels = []
 
-    if domain:
-        tasks.append(apollo_enrich_company(domain))
-        task_labels.append("apollo_company")
-        tasks.append(pdl_enrich_company(domain))
-        task_labels.append("pdl_company")
-    if email:
-        tasks.append(apollo_enrich_contact(email))
-        task_labels.append("apollo_contact")
-        tasks.append(pdl_enrich_contact(email))
-        task_labels.append("pdl_contact")
+    # Hunter — one call returns both person + company. Email-keyed.
+    if email and HUNTER_KEY():
+        tasks.append(hunter_enrich_combined(email))
+        task_labels.append("hunter_combined")
+
+    # Apollo — opt-in fallback if APOLLO_API_KEY is set.
+    if APOLLO_KEY():
+        if domain:
+            tasks.append(apollo_enrich_company(domain))
+            task_labels.append("apollo_company")
+        if email:
+            tasks.append(apollo_enrich_contact(email))
+            task_labels.append("apollo_contact")
+
+    # PDL — domain-keyed company + email-keyed person.
+    if PDL_KEY():
+        if domain:
+            tasks.append(pdl_enrich_company(domain))
+            task_labels.append("pdl_company")
+        if email:
+            tasks.append(pdl_enrich_contact(email))
+            task_labels.append("pdl_contact")
+
+    if not tasks:
+        logger.warning("[enrich] No providers configured — set HUNTER_API_KEY, PDL_API_KEY, or APOLLO_API_KEY")
+        return {"enrichment_sources": []}
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     merged = {"enrichment_sources": []}
-    for i, result in enumerate(results):
-        if isinstance(result, Exception) or result is None:
-            continue
-        source = result.pop("source", task_labels[i])
+
+    def _absorb(result_dict: dict, default_source: str):
+        """Merge a single provider's flat dict into the running record."""
+        if not result_dict:
+            return
+        source = result_dict.pop("source", default_source)
         if source not in merged["enrichment_sources"]:
             merged["enrichment_sources"].append(source)
 
-        for key, value in result.items():
+        for key, value in result_dict.items():
             if value is None or value == "" or value == 0:
                 continue
             if isinstance(value, list):
@@ -256,6 +383,20 @@ async def enrich_lead(domain: str | None, email: str | None) -> dict:
                 merged[key] = existing
             elif key not in merged or merged[key] is None:
                 merged[key] = value
+
+    for i, result in enumerate(results):
+        if isinstance(result, Exception) or result is None:
+            if isinstance(result, Exception):
+                logger.error(f"[enrich] {task_labels[i]} raised: {result}")
+            continue
+
+        # Hunter returns {"person": {...}, "company": {...}}; everything else
+        # returns a single flat dict. Normalize.
+        if "person" in result or "company" in result:
+            _absorb(result.get("person") or {}, task_labels[i])
+            _absorb(result.get("company") or {}, task_labels[i])
+        else:
+            _absorb(result, task_labels[i])
 
     return merged
 
@@ -315,3 +456,148 @@ def _format_funding(val) -> str | None:
             return f"${val / 1_000_000:.0f}M"
         return f"${val:,.0f}"
     return str(val)
+
+
+# ---- Hunter-specific helpers ----
+
+def _map_hunter_seniority(level: str | None) -> str | None:
+    """Map Hunter's seniority strings to our internal taxonomy."""
+    if not level:
+        return None
+    mapping = {
+        "executive": "c_level",
+        "c_level": "c_level",
+        "founder": "c_level",
+        "owner": "c_level",
+        "vp": "vp",
+        "senior": "senior_ic",
+        "manager": "manager",
+        "director": "director",
+        "junior": "ic",
+        "entry": "ic",
+    }
+    return mapping.get(level.lower())
+
+
+def _hunter_linkedin(person: dict) -> str | None:
+    """Extract LinkedIn URL from Hunter person payload, normalizing whatever
+    shape Hunter returns: full URL, path with prefix, or bare handle."""
+    handles = person.get("linkedin") or person.get("social") or {}
+    raw = None
+    if isinstance(handles, str):
+        raw = handles
+    elif isinstance(handles, dict):
+        raw = handles.get("url") or handles.get("handle")
+    return _normalize_linkedin_url(raw, kind="in")
+
+
+def _hunter_company_linkedin(company: dict) -> str | None:
+    """Extract company LinkedIn URL from Hunter company payload."""
+    li = company.get("linkedin") or {}
+    raw = None
+    if isinstance(li, str):
+        raw = li
+    elif isinstance(li, dict):
+        raw = li.get("url") or li.get("handle")
+    return _normalize_linkedin_url(raw, kind="company")
+
+
+def _normalize_linkedin_url(raw: str | None, kind: str) -> str | None:
+    """
+    Normalize a LinkedIn reference into a clean URL.
+    Accepts: full URL, "in/foo", "company/foo", or bare handle "foo".
+    `kind` is "in" (people) or "company" (orgs) — used only when bare handle.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    # Full URL — return as-is
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+    # Path that already includes the prefix segment
+    if s.startswith("in/") or s.startswith("company/"):
+        return f"https://www.linkedin.com/{s}"
+    # Bare handle — prepend the appropriate kind
+    return f"https://www.linkedin.com/{kind}/{s}"
+
+
+def _employees_range_to_int(rng: str | None) -> int | None:
+    """Convert Hunter's 'employees_range' string ('51-200') into a midpoint int."""
+    if not rng or not isinstance(rng, str):
+        return None
+    parts = rng.replace("+", "").split("-")
+    try:
+        nums = [int(p.strip()) for p in parts if p.strip().isdigit()]
+        if not nums:
+            return None
+        return sum(nums) // len(nums)
+    except (ValueError, TypeError):
+        return None
+
+
+def _hunter_funding_stage(rounds) -> str | None:
+    """
+    Hunter's company.fundingRounds is a list of round dicts. Pull the most
+    recent round's stage/type and map to our taxonomy.
+    Examples Hunter sends: 'Seed', 'Series A', 'Series B', 'Private Equity'.
+    """
+    if not rounds or not isinstance(rounds, list):
+        return None
+    # Hunter usually orders most-recent first; fall back to last entry if not.
+    latest = rounds[0] if rounds else None
+    if not isinstance(latest, dict):
+        return None
+    raw = (latest.get("stage") or latest.get("type") or latest.get("name") or "").strip().lower()
+    if not raw:
+        return None
+    if "seed" in raw:
+        return "seed"
+    if "series a" in raw:
+        return "series_a"
+    if "series b" in raw:
+        return "series_b"
+    if "series c" in raw:
+        return "series_c"
+    if "series d" in raw:
+        return "series_d"
+    if "private equity" in raw:
+        return "private_equity"
+    if "ipo" in raw or "public" in raw:
+        return "public"
+    return raw.replace(" ", "_")
+
+
+def _hunter_total_raised(rounds) -> float | None:
+    """Sum amountRaised across Hunter's fundingRounds list."""
+    if not rounds or not isinstance(rounds, list):
+        return None
+    total = 0.0
+    for r in rounds:
+        if not isinstance(r, dict):
+            continue
+        amt = r.get("amountRaised") or r.get("amount") or 0
+        if isinstance(amt, (int, float)):
+            total += amt
+    return total or None
+
+
+def _coerce_employee_count(val) -> int | None:
+    """
+    Normalize whatever Hunter (or any provider) gives us for employee count
+    into an integer, since the DB column is INTEGER. Hunter is inconsistent —
+    'employees' may come as int, '127', '11-50', '1000+', or None.
+    """
+    if val is None or val == "":
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    if isinstance(val, str):
+        s = val.strip()
+        # Pure int like "127"
+        if s.isdigit():
+            return int(s)
+        # Range like "11-50" or "1000+" — fall back to midpoint helper
+        return _employees_range_to_int(s)
+    return None
