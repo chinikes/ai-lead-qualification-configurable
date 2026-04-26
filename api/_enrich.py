@@ -289,15 +289,15 @@ async def hunter_enrich_combined(email: str) -> dict | None:
                 "company_sub_industry": cat.get("subIndustry"),
                 "company_employee_count": _coerce_employee_count(metrics.get("employees") or company_raw.get("employees_range")),
                 "company_revenue": _format_revenue(metrics.get("annualRevenue")),
-                "company_funding_stage": None,   # Hunter doesn't expose funding stage
-                "company_total_funding": _format_funding(metrics.get("raised")),
+                "company_funding_stage": _hunter_funding_stage(company_raw.get("fundingRounds")),
+                "company_total_funding": _format_funding(metrics.get("raised") or _hunter_total_raised(company_raw.get("fundingRounds"))),
                 "company_year_founded": company_raw.get("foundedYear") or company_raw.get("founded"),
                 "company_hq_city": geo_co.get("city"),
                 "company_hq_state": geo_co.get("state"),
                 "company_hq_country": geo_co.get("country"),
                 "company_description": company_raw.get("description"),
                 "company_linkedin_url": _hunter_company_linkedin(company_raw),
-                "company_technologies": company_raw.get("technologies") or [],
+                "company_technologies": (company_raw.get("tech") or []) + (company_raw.get("techCategories") or []),
                 "company_keywords": company_raw.get("tags") or [],
             }
 
@@ -533,6 +533,52 @@ def _employees_range_to_int(rng: str | None) -> int | None:
         return sum(nums) // len(nums)
     except (ValueError, TypeError):
         return None
+
+
+def _hunter_funding_stage(rounds) -> str | None:
+    """
+    Hunter's company.fundingRounds is a list of round dicts. Pull the most
+    recent round's stage/type and map to our taxonomy.
+    Examples Hunter sends: 'Seed', 'Series A', 'Series B', 'Private Equity'.
+    """
+    if not rounds or not isinstance(rounds, list):
+        return None
+    # Hunter usually orders most-recent first; fall back to last entry if not.
+    latest = rounds[0] if rounds else None
+    if not isinstance(latest, dict):
+        return None
+    raw = (latest.get("stage") or latest.get("type") or latest.get("name") or "").strip().lower()
+    if not raw:
+        return None
+    if "seed" in raw:
+        return "seed"
+    if "series a" in raw:
+        return "series_a"
+    if "series b" in raw:
+        return "series_b"
+    if "series c" in raw:
+        return "series_c"
+    if "series d" in raw:
+        return "series_d"
+    if "private equity" in raw:
+        return "private_equity"
+    if "ipo" in raw or "public" in raw:
+        return "public"
+    return raw.replace(" ", "_")
+
+
+def _hunter_total_raised(rounds) -> float | None:
+    """Sum amountRaised across Hunter's fundingRounds list."""
+    if not rounds or not isinstance(rounds, list):
+        return None
+    total = 0.0
+    for r in rounds:
+        if not isinstance(r, dict):
+            continue
+        amt = r.get("amountRaised") or r.get("amount") or 0
+        if isinstance(amt, (int, float)):
+            total += amt
+    return total or None
 
 
 def _coerce_employee_count(val) -> int | None:
