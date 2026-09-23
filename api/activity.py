@@ -22,14 +22,11 @@ class handler(BaseHTTPRequestHandler):
 
             self._json_response(200, {"events": events})
         except Exception as e:
-            # TEMP DIAGNOSTIC — remove once the EBUSY issue is resolved
-            tb = traceback.format_exc()
-            print(tb, flush=True)
-            self._json_response(500, {
-                "error": str(e),
-                "type": type(e).__name__,
-                "trace": tb.splitlines()[-25:],
-            })
+            # Log the full traceback to Vercel's runtime logs, but return only
+            # the message to the client. Keeps future debugging possible without
+            # leaking internals in the API response.
+            print(traceback.format_exc(), flush=True)
+            self._json_response(500, {"error": str(e)})
 
     def _json_response(self, status: int, data: dict):
         self.send_response(status)
