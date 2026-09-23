@@ -6,6 +6,7 @@ GET /api/activity — Activity feed for the dashboard.
 
 from http.server import BaseHTTPRequestHandler
 import json
+import traceback
 from urllib.parse import urlparse, parse_qs
 from _db import get_client, get_activity
 
@@ -21,7 +22,14 @@ class handler(BaseHTTPRequestHandler):
 
             self._json_response(200, {"events": events})
         except Exception as e:
-            self._json_response(500, {"error": str(e)})
+            # TEMP DIAGNOSTIC — remove once the EBUSY issue is resolved
+            tb = traceback.format_exc()
+            print(tb, flush=True)
+            self._json_response(500, {
+                "error": str(e),
+                "type": type(e).__name__,
+                "trace": tb.splitlines()[-25:],
+            })
 
     def _json_response(self, status: int, data: dict):
         self.send_response(status)
